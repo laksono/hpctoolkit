@@ -168,6 +168,11 @@ Profile::Profile(const std::string name)
 
   m_traceMinTime = UINT64_MAX;
   m_traceMaxTime = 0;
+  m_traceInfo.active = false;
+  m_traceGbl = NULL;
+  m_numFiles = 0;
+  m_numActive = 0;
+  m_doPlot = 0;
 
   m_mMgr = new Metric::Mgr;
   m_isMetricMgrVirtual = false;
@@ -273,7 +278,15 @@ Profile::merge(Profile& y, int mergeTy, uint mrgFlag)
 			     mrgFlag & CCT::MrgFlg_NormalizeTraceFileY),
 	      "CallPath::Profile::merge: there should only be CCT::MergeEffects when MrgFlg_NormalizeTraceFileY is passed");
 
-  y.merge_fixTrace(mrgEffects2);
+  if (Prof::Database::newDBFormat()) {
+    if ((mrgFlag & CCT::MrgFlg_NormalizeTraceFileY) && y.m_traceInfo.active) {
+      Prof::Database::writeTraceFile(&y, mrgEffects2);
+    }
+  }
+  else {
+    y.merge_fixTrace(mrgEffects2);
+  }
+
   delete mrgEffects2;
 
   return firstMergedMetric;
@@ -739,7 +752,23 @@ Profile::writeXML_hdr(std::ostream& os, uint metricBeg, uint metricEnd,
   UIntToStringMap metricIdToFormula;
 
   // -------------------------------------------------------
-  //
+  // File Names for Binary Metrics
+  // -------------------------------------------------------
+  if (Prof::Database::newDBFormat()) {
+    os << "  <SummaryDBFile name=\"summary.db\"/>\n";
+    if (m_numActive > 0) {
+      os << "  <TraceDBFile name=\"trace.db\"/>\n";
+    }
+    if (m_doPlot) {
+      os << "  <PlotDBFile name=\"plot.db\"/>\n";
+    }
+    if (m_numActive > 0 || m_doPlot) {
+      os << "  <ThreadIDFile name=\"threads.db\"/>\n";
+    }
+  }
+
+  // -------------------------------------------------------
+  // Metric Table and Formulas
   // -------------------------------------------------------
   os << "  <MetricTable>\n";
   for (uint i = metricBeg; i < metricEnd; i++) {

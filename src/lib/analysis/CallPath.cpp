@@ -59,6 +59,10 @@
 
 //************************* System Include Files ****************************
 
+#include <sys/types.h>
+#include <err.h>
+#include <errno.h>
+
 #include <iostream>
 using std::hex;
 using std::dec;
@@ -91,6 +95,7 @@ using std::string;
 #include <lib/profxml/XercesUtil.hpp>
 #include <lib/profxml/PGMReader.hpp>
 
+#include <lib/prof/Database.hpp>
 #include <lib/prof-lean/hpcrun-metric.h>
 
 #include <lib/binutils/LM.hpp>
@@ -140,25 +145,50 @@ namespace CallPath {
 
 Prof::CallPath::Profile*
 read(const Util::StringVec& profileFiles, const Util::UIntVec* groupMap,
+     Prof::Database::traceInfo * trace,
      int mergeTy, uint rFlags, uint mrgFlags)
 {
-  // Special case
+  bool new_trace_now = Prof::Database::newDBFormat()
+    && ((mrgFlags & Prof::CCT::MrgFlg_NormalizeTraceFileY) != 0);
+  long num_files = profileFiles.size();
+  off_t offset;
+
+  // Special case, no files
   if (profileFiles.empty()) {
     Prof::CallPath::Profile* prof = Prof::CallPath::Profile::make(rFlags);
     return prof;
   }
-  
-  // General case
+
+  // General case, first file 0
   uint groupId = (groupMap) ? (*groupMap)[0] : 0;
   Prof::CallPath::Profile* prof = read(profileFiles[0], groupId, rFlags);
 
+  offset = Prof::Database::firstTraceOffset(num_files);
+  offset = Prof::Database::alignOffset(offset);
+  prof->m_traceInfo.start_offset = offset;
+
+  if (new_trace_now && prof->m_traceInfo.active) {
+    Prof::Database::writeTraceFile(prof, NULL);
+    offset += prof->m_traceInfo.length;
+    offset = Prof::Database::alignOffset(offset);
+  }
+  trace[0] = prof->m_traceInfo;
+  
   // add the directory into the set of directories
   prof->addDirectory(profileFiles[0]);
 
   for (uint i = 1; i < profileFiles.size(); ++i) {
     groupId = (groupMap) ? (*groupMap)[i] : 0;
     Prof::CallPath::Profile* p = read(profileFiles[i], groupId, rFlags);
+
+    p->m_traceInfo.start_offset = offset;
     prof->merge(*p, mergeTy, mrgFlags);
+
+    if (p->m_traceInfo.active) {
+      offset += p->m_traceInfo.length;
+      offset = Prof::Database::alignOffset(offset);
+    }
+    trace[i] = p->m_traceInfo;
 
     prof->metricMgr()->mergePerfEventStatistics(p->metricMgr());
     delete p;
@@ -1072,10 +1102,6 @@ namespace Analysis {
 
 namespace CallPath {
 
-static void
-write(Prof::CallPath::Profile& prof, std::ostream& os,
-      const Analysis::Args& args);
-
 
 // makeDatabase: assumes Analysis::Args::makeDatabaseDir() has been called
 void
@@ -1091,7 +1117,9 @@ makeDatabase(Prof::CallPath::Profile& prof, const Analysis::Args& args)
 				  args.searchPathTpls, db_dir);
 
   // 2. Copy trace files (if necessary)
-  Analysis::Util::copyTraceFiles(db_dir, prof.traceFileNameSet());
+  if (! args.new_db_format) {
+    Analysis::Util::copyTraceFiles(db_dir, prof.traceFileNameSet());
+  }
 
   // 3. Create 'experiment.xml' file
   string experiment_fnm = db_dir + "/" + args.out_db_experiment;
@@ -1106,11 +1134,16 @@ makeDatabase(Prof::CallPath::Profile& prof, const Analysis::Args& args)
   Analysis::CallPath::write(prof, *os, args);
   IOUtil::CloseStream(os);
 
+  // 5. Make summary.db file (new-db format).
+  if (args.new_db_format) {
+    Prof::Database::makeSummaryDB(prof, args);
+  }
+
   delete[] outBuf;
 }
 
 
-static void
+void
 write(Prof::CallPath::Profile& prof, std::ostream& os,
       const Analysis::Args& args)
 {
@@ -1146,7 +1179,11 @@ write(Prof::CallPath::Profile& prof, std::ostream& os,
   os << "<?xml version=\"1.0\"?>\n";
   os << "<!DOCTYPE HPCToolkitExperiment [\n" << experimentDTD << "]>\n";
 
-  os << "<HPCToolkitExperiment version=\"2.1\">\n";
+  if (Prof::Database::newDBFormat()) {
+    os << "<HPCToolkitExperiment version=\"3.0\">\n";
+  } else {
+    os << "<HPCToolkitExperiment version=\"2.1\">\n";
+  }
   os << "<Header n" << MakeAttrStr(name) << ">\n";
   os << "  <Info/>\n";
   os << "</Header>\n";

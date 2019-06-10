@@ -109,6 +109,7 @@ public:
   IData(size_t size = 0)
   {
     ensureMetricsSize(size);
+    m_numPlotMetrics = 0;
   }
 
   virtual ~IData()
@@ -118,12 +119,14 @@ public:
   IData(const IData& x)
     : m_metrics(x.m_metrics)
   {
+    m_numPlotMetrics = x.m_numPlotMetrics;
   }
   
   IData&
   operator=(const IData& x)
   {
     m_metrics = x.m_metrics;
+    m_numPlotMetrics = x.m_numPlotMetrics;
     return *this;
   }
 
@@ -247,6 +250,10 @@ public:
   
 private:
   mutable MetricVec m_metrics;
+
+public:
+  // for prof-mpi to count the number of plot metrics per cct node
+  ulong m_numPlotMetrics;
 };
 
 //***************************************************************************

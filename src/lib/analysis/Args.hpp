@@ -203,6 +203,7 @@ public:
 
   bool db_makeMetricDB;
   bool db_addStructId;
+  bool new_db_format;
 
   // -------------------------------------------------------
   // Output arguments: textual output

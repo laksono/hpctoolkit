@@ -75,7 +75,7 @@ using std::string;
 
 #include <lib/analysis/CallPath.hpp>
 #include <lib/analysis/Util.hpp>
-
+#include <lib/prof/Database.hpp>
 #include <lib/support/diagnostics.h>
 #include <lib/support/RealPathMgr.hpp>
 
@@ -163,6 +163,16 @@ realmain(int argc, char* const* argv)
     DIAG_Throw("You have requested thread-level metrics for " << nArgs.paths->size() << " profile files.  Because this may result in an unusable database, to continue you must use the --force-metric option.");
   }
 
+
+  // -------------------------------------------------------
+  // 0. Make empty Experiment database (ensure file system works)
+  // -------------------------------------------------------
+
+  args.makeDatabaseDir();
+  if (args.new_db_format) {
+    Prof::Database::initdb(args);
+  }
+
   // ------------------------------------------------------------
   // 1a. Create canonical CCT // Normalize trace files
   // ------------------------------------------------------------
@@ -177,17 +187,40 @@ realmain(int argc, char* const* argv)
   }
   uint mrgFlags = (Prof::CCT::MrgFlg_NormalizeTraceFileY);
 
+  long numFiles = nArgs.paths->size();
+  Prof::Database::traceInfo *trace =
+    (Prof::Database::traceInfo *) malloc(numFiles * sizeof(Prof::Database::traceInfo));
+
+  DIAG_Assert(trace != NULL, "out of memory in hpcprof");
+
+  for (long i = 0; i < numFiles; i++) {
+    trace[i].active = false;
+  }
+
   Prof::CallPath::Profile* prof =
-    Analysis::CallPath::read(*nArgs.paths, groupMap, mergeTy, rFlags, mrgFlags);
+    Analysis::CallPath::read(*nArgs.paths, groupMap, trace, mergeTy, rFlags, mrgFlags);
+
+  // count the number of active trace files
+  long numActive = 0;
+  for (long k = 0; k < numFiles; k++) {
+    if (trace[k].active) {
+      numActive++;
+    }
+  }
+
+  prof->m_traceGbl = trace;
+  prof->m_numFiles = numFiles;
+  prof->m_numActive = numActive;
+
+  if (Prof::Database::newDBFormat() && numActive > 0) {
+    Prof::Database::writeTraceIndex(trace, numFiles, numActive);
+    Prof::Database::writeTraceHeader(trace, numFiles, numActive);
+    Prof::Database::endTraceFiles();
+    Prof::Database::writeThreadIDFile(trace, numFiles);
+  }
 
   prof->disable_redundancy(args.remove_redundancy);
 
-
-  // -------------------------------------------------------
-  // 0. Make empty Experiment database (ensure file system works)
-  // -------------------------------------------------------
-
-  args.makeDatabaseDir();
 
   // ------------------------------------------------------------
   // 1b. Add static structure to canonical CCT

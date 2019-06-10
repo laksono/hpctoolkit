@@ -216,6 +216,10 @@ normalizeProfileArgs(const StringVec& inPaths)
     }
   }
 
+  // this list is the initial, global list
+  out.begTid = 0;
+  out.numTid = out.paths->size();
+
   return out;
 }
 

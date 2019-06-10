@@ -155,6 +155,7 @@ Options: Output:\n\
   --metric-db <yes|no>\n\
                        Control whether to generate a thread-level metric\n\
                        value database for hpcviewer scatter plots. {yes}\n\
+  --new-db             Use new binary db format for metrics (work in progress).\n\
   --remove-redundancy \n\
                        Eliminate procedure name redundancy in experiment.xml\n\
   --struct-id          Add 'str=nnn' field to profile data with the hpcstruct\n\
@@ -203,6 +204,8 @@ CmdLineParser::OptArgDesc Analysis::ArgsHPCProf::optArgs[] = {
   {  0 , "db",              CLP::ARG_REQ , CLP::DUPOPT_CLOB, NULL,
      NULL },
   {  0 , "metric-db",       CLP::ARG_REQ,  CLP::DUPOPT_CLOB, NULL,
+     NULL },
+  {  0 , "new-db",          CLP::ARG_NONE, CLP::DUPOPT_CLOB, NULL,
      NULL },
   {  0 , "struct-id",       CLP::ARG_NONE, CLP::DUPOPT_CLOB, NULL,
      NULL },
@@ -411,6 +414,9 @@ ArgsHPCProf::parse(int argc, const char* const argv[])
     }
     if (parser.isOpt("struct-id")) {
       db_addStructId = true;
+    }
+    if (parser.isOpt("new-db")) {
+      new_db_format = true;
     }
 
     // Check for required arguments

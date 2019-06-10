@@ -76,6 +76,7 @@
 
 #include <lib/binutils/LM.hpp>
 
+#include <lib/prof/Database.hpp>
 #include <lib/prof/CallPath-Profile.hpp>
 #include <lib/prof/Struct-Tree.hpp>
 
@@ -96,6 +97,7 @@ extern std::ostream* dbgOs; // for parallel debugging
 
 Prof::CallPath::Profile*
 read(const Util::StringVec& profileFiles, const Util::UIntVec* groupMap,
+     Prof::Database::traceInfo * trace,
      int mergeTy, uint rFlags = 0, uint mrgFlags = 0);
 
 Prof::CallPath::Profile*
@@ -183,6 +185,10 @@ applySummaryMetricAgents(Prof::CallPath::Profile& prof, string agent);
 void
 makeDatabase(Prof::CallPath::Profile& prof, const Analysis::Args& args);
 
+
+void 
+write(Prof::CallPath::Profile& prof, std::ostream& os,
+      const Analysis::Args& args);
 
 } // namespace CallPath
 

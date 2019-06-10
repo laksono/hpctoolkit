@@ -77,6 +77,8 @@
 #include "Metric-Mgr.hpp"
 #include "LoadMap.hpp"
 #include "CCT-Tree.hpp"
+#include "Database.hpp"
+
 #include "StringSet.hpp"
 
 #include <lib/support/FileUtil.hpp> // dirname
@@ -130,6 +132,8 @@ public:
   StringSet&
   traceFileNameSet()
   { return m_traceFileNameSet; }
+
+  std::string & traceFileName() { return m_traceFileName; }
 
   // enable/disable redundancy of procedure names
   // @param flag: true  -- redundancy is eliminated
@@ -389,6 +393,14 @@ private:
   Prof::Struct::Tree* m_structure;
  
   bool m_remove_redundancy;
+
+public:
+  Prof::Database::traceInfo m_traceInfo;
+  Prof::Database::traceInfo * m_traceGbl;
+  long  m_numFiles;
+  long  m_numActive;
+  int   m_doPlot;
+
 };
 
 } // namespace CallPath

@@ -87,6 +87,7 @@ using std::vector;
 
 #include "Args.hpp"
 #include "ParallelAnalysis.hpp"
+#include "Plot-Trace.hpp"
 
 #include <lib/analysis/CallPath.hpp>
 #include <lib/analysis/Util.hpp>
@@ -94,6 +95,7 @@ using std::vector;
 #include <lib/binutils/VMAInterval.hpp>
 #include <lib/prof/FileError.hpp>
 
+#include <lib/prof/Database.hpp>
 #include <lib/prof-lean/hpcrun-fmt.h>
 
 #include <lib/support/diagnostics.h>
@@ -111,22 +113,28 @@ realmain(int argc, char* const* argv);
 static Analysis::Util::NormalizeProfileArgs_t
 myNormalizeProfileArgs(const Analysis::Util::StringVec& profileFiles,
 		       vector<uint>& groupIdToGroupSizeMap,
-		       int myRank, int numRanks);
+		       int myRank, int numRanks, int rootRank = 0);
 
+static void
+addPlotMetrics(Prof::CallPath::Profile & prof, uint begMet, uint endMet);
+
+static void
+resetPlotMetrics(Prof::CallPath::Profile & prof);
 
 static void
 makeSummaryMetrics(Prof::CallPath::Profile& profGbl,
 		   const Analysis::Args& args,
 		   const Analysis::Util::NormalizeProfileArgs_t& nArgs,
 		   const vector<uint>& groupIdToGroupSizeMap,
-		   int myRank, int numRanks);
+		   int myRank, int numRanks, int rootRank);
 
 static void
 makeThreadMetrics(Prof::CallPath::Profile& profGbl,
 		  const Analysis::Args& args,
 		  const Analysis::Util::NormalizeProfileArgs_t& nArgs,
 		  const vector<uint>& groupIdToGroupSizeMap,
-		  int myRank, int numRanks);
+		  Prof::Database::traceInfo *traceLcl, int doPlot,
+		  int myRank, int numRanks, int rootRank);
 
 static uint
 makeDerivedMetricDescs(Prof::CallPath::Profile& profGbl,
@@ -135,7 +143,7 @@ makeDerivedMetricDescs(Prof::CallPath::Profile& profGbl,
 		       uint& mXDrvdBeg, uint& mXDrvdEnd,
 		       vector<VMAIntervalSet*>& groupIdToGroupMetricsMap,
 		       const vector<uint>& groupIdToGroupSizeMap,
-		       int myRank);
+		       int myRank, int rootRank);
 
 static void
 makeSummaryMetrics_Lcl(Prof::CallPath::Profile& profGbl,
@@ -147,8 +155,10 @@ makeSummaryMetrics_Lcl(Prof::CallPath::Profile& profGbl,
 static void
 makeThreadMetrics_Lcl(Prof::CallPath::Profile& profGbl,
 		      const string& profileFile,
-		      const Analysis::Args& args, uint groupId, uint groupMax,
-		      int myRank);
+		      const Analysis::Args& args,
+		      Prof::Database::traceInfo *traceLcl,
+		      uint threadId, int doPlot,
+		      uint groupId, uint groupMax, int myRank);
 
 static string
 makeDBFileName(const string& dbDir, uint groupId, const string& profileFile);
@@ -248,6 +258,7 @@ realmain(int argc, char* const* argv)
   // -------------------------------------------------------
   MPI_Init(&argc, (char***)&argv);
 
+  const int rootRank = 0;
   int myRank, numRanks;
   MPI_Comm_rank(MPI_COMM_WORLD, &myRank); 
   MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
@@ -257,7 +268,7 @@ realmain(int argc, char* const* argv)
   // -------------------------------------------------------
   const char* HPCPROF_WAIT = getenv("HPCPROF_WAIT");
   if (HPCPROF_WAIT) {
-    int waitRank = 0;
+    int waitRank = rootRank;
     if (strlen(HPCPROF_WAIT) > 0) {
       waitRank = atoi(HPCPROF_WAIT);
     }
@@ -271,29 +282,32 @@ realmain(int argc, char* const* argv)
   // -------------------------------------------------------
   // 0. Make empty Experiment database (ensure file system works)
   // -------------------------------------------------------
-  if (myRank == 0)
+  char dbDirBuf[PATH_MAX];
+  if (myRank == rootRank) {
     args.makeDatabaseDir();
 
-  char dbDirBuf[PATH_MAX];
-  if (myRank == 0) {
     memset(dbDirBuf, '\0', PATH_MAX); // avoid artificial valgrind warnings
     strncpy(dbDirBuf, args.db_dir.c_str(), PATH_MAX);
     dbDirBuf[PATH_MAX - 1] = '\0';
   }
 
-  MPI_Bcast((void*)dbDirBuf, PATH_MAX, MPI_CHAR, 0, MPI_COMM_WORLD);
+  MPI_Bcast((void*)dbDirBuf, PATH_MAX, MPI_CHAR, rootRank, MPI_COMM_WORLD);
   args.db_dir = dbDirBuf;
+
+  if (args.new_db_format) {
+    Prof::Database::initdb(args);
+  }
 
   // -------------------------------------------------------
   // 1a. Create local CCT (from local set of profile files)
   // -------------------------------------------------------
   Prof::CallPath::Profile* profLcl = NULL;
 
-  vector<uint> groupIdToGroupSizeMap; // only initialized for rank 0
+  vector<uint> groupIdToGroupSizeMap; // only initialized for rootRank
 
   Analysis::Util::NormalizeProfileArgs_t nArgs =
     myNormalizeProfileArgs(args.profileFiles, groupIdToGroupSizeMap,
-			   myRank, numRanks);
+			   myRank, numRanks, rootRank);
 
   if (nArgs.paths->size() == 0 && myRank == 0) {
     std::cerr << "ERROR: command line directories"
@@ -308,7 +322,39 @@ realmain(int argc, char* const* argv)
   Analysis::Util::UIntVec* groupMap =
     (nArgs.groupMax > 1) ? nArgs.groupMap : NULL;
 
-  profLcl = Analysis::CallPath::read(*nArgs.paths, groupMap, mergeTy, rFlags);
+  // collect trace info on size, rank, tid, etc.
+  long numFiles = nArgs.numFiles;
+  long numPerRank = nArgs.numPerRank;
+  long totalFiles = numPerRank * numRanks;
+  long traceInfoSize = sizeof(Prof::Database::traceInfo);
+
+  Prof::Database::traceInfo * traceLcl =
+    (Prof::Database::traceInfo *) malloc(numPerRank * traceInfoSize);
+
+  DIAG_Assert(traceLcl != NULL,
+	      "unable to malloc local traceInfo for rank: " << myRank);
+
+  for (long i = 0; i < numPerRank; i++) {
+    traceLcl[i].active = false;
+  }
+
+  profLcl = Analysis::CallPath::read(*nArgs.paths, groupMap, traceLcl, mergeTy, rFlags);
+
+  // rank 0 computes prefix sum on the lengths of the trace files to
+  // determine their starting offsets.
+  Prof::Database::traceInfo * traceGbl = NULL;
+  long numActive = 0;
+
+  if (Prof::Database::newDBFormat()) {
+    if (myRank == rootRank) {
+      traceGbl = (Prof::Database::traceInfo *) malloc(totalFiles * traceInfoSize);
+
+      DIAG_Assert(traceGbl != NULL,
+		  "unable to malloc global traceInfo for rank: " << myRank);
+    }
+    Trace::mergeTraceInfo(traceGbl, traceLcl, numPerRank, numActive,
+			  myRank, numRanks, rootRank);
+  }
 
   // -------------------------------------------------------
   // 1b. Create canonical CCT (metrics merged by <group>.<name>.*)
@@ -321,7 +367,7 @@ realmain(int argc, char* const* argv)
 
   ParallelAnalysis::reduce(&profLcl->directorySet(), myRank, numRanks);
 
-  if (myRank == 0) {
+  if (myRank == rootRank) {
     profGbl = profLcl;
     profLcl = NULL;
   }
@@ -329,7 +375,7 @@ realmain(int argc, char* const* argv)
   // Post-INVARIANT: 'profGbl' is the canonical CCT
   ParallelAnalysis::broadcast(profGbl, myRank);
 
-  if (myRank == 0) {
+  if (myRank == rootRank) {
     profGbl->metricMgr()->mergePerfEventStatistics_finalize(numRanks - 1);
   }
 
@@ -366,8 +412,10 @@ realmain(int argc, char* const* argv)
   //
   // Post-INVARIANT: rank 0's 'profGbl' contains summary metrics
   // -------------------------------------------------------
+  resetPlotMetrics(*profGbl);
+
   makeSummaryMetrics(*profGbl, args, nArgs, groupIdToGroupSizeMap,
-		     myRank, numRanks);
+		     myRank, numRanks, rootRank);
 
   // -------------------------------------------------------
   // 2b. Prune and normalize canonical CCT
@@ -377,7 +425,7 @@ realmain(int argc, char* const* argv)
   uint8_t* prunedNodes = new uint8_t[prunedNodesSz];
   memset(prunedNodes, 0, prunedNodesSz * sizeof(uint8_t));
 
-  if (myRank == 0) {
+  if (myRank == rootRank) {
     // Disable pruning when making a metric database because it causes
     // makeThreadMetrics_Lcl(), which uses CCT::MrgFlg_CCTMergeOnly,
     // to under-compute values for thread-level metrics.
@@ -386,16 +434,16 @@ realmain(int argc, char* const* argv)
     }
   }
   
-  MPI_Bcast(prunedNodes, prunedNodesSz, MPI_BYTE, 0, MPI_COMM_WORLD);
+  MPI_Bcast(prunedNodes, prunedNodesSz, MPI_BYTE, rootRank, MPI_COMM_WORLD);
 
-  if (myRank != 0) {
+  if (myRank != rootRank) {
     profGbl->cct()->pruneCCTByNodeId(prunedNodes);
   }
   delete[] prunedNodes;
 
   Analysis::CallPath::normalize(*profGbl, args.agent, args.doNormalizeTy);
 
-  if (myRank == 0) {
+  if (myRank == rootRank) {
     // Apply after all CCT pruning/normalization is completed.
     Analysis::CallPath::applySummaryMetricAgents(*profGbl, args.agent);
   }
@@ -406,9 +454,44 @@ realmain(int argc, char* const* argv)
   // -------------------------------------------------------
   // 2c. Create thread-level metric DB // Normalize trace files
   // -------------------------------------------------------
+  uint maxCCTid = profGbl->cct()->maxDenseId();
+  int doPlot = 0;
+
+  // malloc space for plot graphs
+  if (args.db_makeMetricDB && Prof::Database::newDBFormat()) {
+    doPlot = Plot::allocBuffers(*profGbl, myRank, numRanks, rootRank);
+
+    if (! doPlot && myRank == rootRank) {
+      std::cerr << "unable to make plot graphs: not enough memory\n";
+    }
+  }
+
   makeThreadMetrics(*profGbl, args, nArgs, groupIdToGroupSizeMap,
-		    myRank, numRanks);
-  
+		    traceLcl, doPlot, myRank, numRanks, rootRank);
+
+  // rank 0 writes the trace index and header
+  if (Prof::Database::newDBFormat()) {
+    if (myRank == rootRank && numActive > 0) {
+      Prof::Database::writeTraceIndex(traceGbl, numFiles, numActive);
+      Prof::Database::writeTraceHeader(traceGbl, numFiles, numActive);
+    }
+    Prof::Database::endTraceFiles();
+  }
+
+  // write plot graphs, if malloc worked
+  if (doPlot) {
+    Plot::sharePlotPoints(myRank, numRanks, rootRank);
+
+    Plot::writePlotGraphs(args.db_dir, maxCCTid, totalFiles,
+			  myRank, numRanks, rootRank);
+  }
+
+  // write the thread id file
+  if (Prof::Database::newDBFormat() && myRank == rootRank
+      && (numActive > 0 || doPlot)) {
+    Prof::Database::writeThreadIDFile(traceGbl, numFiles);
+  }
+
   // ------------------------------------------------------------
   // 3. Generate Experiment database
   //    INVARIANT: database dir already exists
@@ -416,7 +499,7 @@ realmain(int argc, char* const* argv)
 
   Analysis::CallPath::pruneStructTree(*profGbl);
 
-  if (myRank == 0) {
+  if (myRank == rootRank) {
     if (args.title.empty()) {
       args.title = profGbl->name();
     }
@@ -425,10 +508,17 @@ realmain(int argc, char* const* argv)
       profGbl->metricMgr()->zeroDBInfo();
     }
 
+    profGbl->m_traceGbl = traceGbl;
+    profGbl->m_numFiles = numFiles;
+    profGbl->m_numActive = numActive;
+    profGbl->m_doPlot = doPlot;
+
     Analysis::CallPath::makeDatabase(*profGbl, args);
   }
   else {
-    Analysis::Util::copyTraceFiles(args.db_dir, profGbl->traceFileNameSet());
+    if (! Prof::Database::newDBFormat()) {
+      Analysis::Util::copyTraceFiles(args.db_dir, profGbl->traceFileNameSet());
+    }
   }
 
   // -------------------------------------------------------
@@ -452,7 +542,7 @@ realmain(int argc, char* const* argv)
 static Analysis::Util::NormalizeProfileArgs_t
 myNormalizeProfileArgs(const Analysis::Util::StringVec& profileFiles,
 		       vector<uint>& groupIdToGroupSizeMap,
-		       int myRank, int numRanks)
+		       int myRank, int numRanks, int rootRank)
 {
   Analysis::Util::NormalizeProfileArgs_t out;
 
@@ -462,18 +552,24 @@ myNormalizeProfileArgs(const Analysis::Util::StringVec& profileFiles,
   const uint groupIdLen = 1; // see asssertion below
   uint pathLenMax = 0;
   uint groupIdMax = 0;
+  uint totalThreads = 0;
+  uint numPerRank = 0;
+  uint itemSz = 0;
 
   // -------------------------------------------------------
   // root creates canonical and grouped list of files
   // -------------------------------------------------------
 
-  if (myRank == 0) {
+  if (myRank == rootRank) {
     Analysis::Util::NormalizeProfileArgs_t nArgs =
       Analysis::Util::normalizeProfileArgs(profileFiles);
     
     Analysis::Util::StringVec* canonicalFiles = nArgs.paths;
     pathLenMax = nArgs.pathLenMax;
     groupIdMax = nArgs.groupMax;
+    totalThreads = nArgs.numTid;
+    numPerRank = (totalThreads + numRanks - 1)/numRanks;
+    itemSz = groupIdLen + pathLenMax + 1;
 
     DIAG_Assert(nArgs.groupMax <= UCHAR_MAX, "myNormalizeProfileArgs: 'groupMax' cannot be packed into a uchar!");
 
@@ -507,19 +603,23 @@ myNormalizeProfileArgs(const Analysis::Util::StringVec& profileFiles,
   // prepare parameters for scatter
   // -------------------------------------------------------
   
-  const uint metadataBufSz = 3;
+  const uint metadataBufSz = 4;
   uint metadataBuf[metadataBufSz];
   metadataBuf[0] = sendFilesChunkSz;
   metadataBuf[1] = pathLenMax;
   metadataBuf[2] = groupIdMax;
+  metadataBuf[3] = totalThreads;
 
   MPI_Bcast((void*)metadataBuf, metadataBufSz, MPI_UNSIGNED,
-	    0, MPI_COMM_WORLD);
+	    rootRank, MPI_COMM_WORLD);
 
-  if (myRank != 0) {
+  if (myRank != rootRank) {
     sendFilesChunkSz = metadataBuf[0];
     pathLenMax       = metadataBuf[1];
     groupIdMax       = metadataBuf[2];
+    totalThreads     = metadataBuf[3];
+    numPerRank = (totalThreads + numRanks - 1)/numRanks;
+    itemSz = groupIdLen + pathLenMax + 1;
   }
 
   // -------------------------------------------------------
@@ -531,7 +631,7 @@ myNormalizeProfileArgs(const Analysis::Util::StringVec& profileFiles,
   
   MPI_Scatter((void*)sendFilesBuf, sendFilesChunkSz, MPI_CHAR,
 	      (void*)recvFilesBuf, recvFilesChunkSz, MPI_CHAR,
-	      0, MPI_COMM_WORLD);
+	      rootRank, MPI_COMM_WORLD);
   
   delete[] sendFilesBuf;
 
@@ -548,6 +648,10 @@ myNormalizeProfileArgs(const Analysis::Util::StringVec& profileFiles,
 
   out.pathLenMax = pathLenMax;
   out.groupMax = groupIdMax;
+  out.numFiles = totalThreads;
+  out.numPerRank = numPerRank;
+  out.begTid = std::min(myRank * numPerRank, totalThreads);
+  out.numTid = out.paths->size();
 
   delete[] recvFilesBuf;
 
@@ -562,6 +666,41 @@ myNormalizeProfileArgs(const Analysis::Util::StringVec& profileFiles,
 }
 
 
+// Count the number of non-zero plot metrics per CCT node and save
+// them in profGbl's nodes.  At each merge, makeSummaryMetrics puts
+// the metrics from one local profile into profGbl (and then zeros
+// them for the next profile).
+//
+static void
+addPlotMetrics(Prof::CallPath::Profile & prof, uint begMet, uint endMet)
+{
+  Prof::CCT::Tree * cct = prof.cct();
+  uint maxid = cct->maxDenseId();
+
+  for (uint cctid = 1; cctid <= maxid; cctid++) {
+    Prof::CCT::ANode * node = cct->findNode(cctid);
+
+    for (uint metid = begMet; metid < endMet; metid++) {
+      if (metid < node->numMetrics() && node->metric(metid) != 0.0) {
+	node->m_numPlotMetrics++;
+      }
+    }
+  }
+}
+
+static void
+resetPlotMetrics(Prof::CallPath::Profile & prof)
+{
+  Prof::CCT::Tree * cct = prof.cct();
+  uint maxid = cct->maxDenseId();
+
+  for (uint cctid = 1; cctid <= maxid; cctid++) {
+    Prof::CCT::ANode * node = cct->findNode(cctid);
+    node->m_numPlotMetrics = 0;
+  }
+}
+
+
 //***************************************************************************
 
 // makeSummaryMetrics: Assumes 'profGbl' is the canonical CCT (with
@@ -571,7 +710,7 @@ makeSummaryMetrics(Prof::CallPath::Profile& profGbl,
 		   const Analysis::Args& args,
 		   const Analysis::Util::NormalizeProfileArgs_t& nArgs,
 		   const vector<uint>& groupIdToGroupSizeMap,
-		   int myRank, int numRanks)
+		   int myRank, int numRanks, int rootRank)
 {
   uint mDrvdBeg = 0, mDrvdEnd = 0;   // [ )
   uint mXDrvdBeg = 0, mXDrvdEnd = 0; // [ )
@@ -581,7 +720,7 @@ makeSummaryMetrics(Prof::CallPath::Profile& profGbl,
   makeDerivedMetricDescs(profGbl, args,
 			 mDrvdBeg, mDrvdEnd, mXDrvdBeg, mXDrvdEnd,
 			 groupIdToGroupMetricsMap, groupIdToGroupSizeMap,
-			 myRank);
+			 myRank, rootRank);
 
   Prof::Metric::Mgr& mMgrGbl = *profGbl.metricMgr();
   Prof::CCT::ANode* cctRoot = profGbl.cct()->root();
@@ -640,7 +779,7 @@ makeSummaryMetrics(Prof::CallPath::Profile& profGbl,
   // finalize metrics
   // -------------------------------------------------------
 
-  if (myRank == 0) {
+  if (myRank == rootRank) {
     
     for (uint i = 0; i < mMgrGbl.size(); ++i) {
       Prof::Metric::ADesc* m = mMgrGbl.metric(i);
@@ -661,12 +800,14 @@ makeThreadMetrics(Prof::CallPath::Profile& profGbl,
 		  const Analysis::Args& args,
 		  const Analysis::Util::NormalizeProfileArgs_t& nArgs,
 		  const vector<uint>& groupIdToGroupSizeMap,
-		  int myRank, int numRanks)
+		  Prof::Database::traceInfo *traceLcl, int doPlot,
+		  int myRank, int numRanks, int rootRank)
 {
   for (uint i = 0; i < nArgs.paths->size(); ++i) {
     string& fnm = (*nArgs.paths)[i];
     uint groupId = (*nArgs.groupMap)[i];
-    makeThreadMetrics_Lcl(profGbl, fnm, args, groupId, nArgs.groupMax, myRank);
+    makeThreadMetrics_Lcl(profGbl, fnm, args, &traceLcl[i], nArgs.begTid + i,
+			  doPlot, groupId, nArgs.groupMax, myRank);
   }
 }
 
@@ -678,7 +819,7 @@ makeDerivedMetricDescs(Prof::CallPath::Profile& profGbl,
 		       uint& mXDrvdBeg, uint& mXDrvdEnd,
 		       vector<VMAIntervalSet*>& groupIdToGroupMetricsMap,
 		       const vector<uint>& groupIdToGroupSizeMap,
-		       int myRank)
+		       int myRank, int rootRank)
 {
   Prof::Metric::Mgr& mMgrGbl = *(profGbl.metricMgr());
 
@@ -722,13 +863,13 @@ makeDerivedMetricDescs(Prof::CallPath::Profile& profGbl,
     DIAG_Assert(groupId > 0, DIAG_UnexpectedInput);
     DIAG_Assert(groupId < groupIdToGroupMetricsMap.size(), DIAG_UnexpectedInput);
 
-    // rank 0: set the number of inputs
-    if (myRank == 0) {
+    // rootRank: set the number of inputs
+    if (myRank == rootRank) {
       Prof::Metric::DerivedIncrDesc* mm = 
 	dynamic_cast<Prof::Metric::DerivedIncrDesc*>(m);
       DIAG_Assert(mm, DIAG_UnexpectedInput);
     
-      // N.B.: groupIdToGroupSizeMap is only initialized for rank 0
+      // N.B.: groupIdToGroupSizeMap is only initialized for rootRank
       uint numInputs = groupIdToGroupSizeMap[groupId]; // / <n> TODO:threads
       if (mm->expr()) {
         mm->expr()->numSrcFxd(numInputs);
@@ -839,6 +980,7 @@ makeSummaryMetrics_Lcl(Prof::CallPath::Profile& profGbl,
   cctRootGbl->aggregateMetricsIncl(ivalsetIncl);
   cctRootGbl->aggregateMetricsExcl(ivalsetExcl);
 
+  addPlotMetrics(profGbl, mBeg, mEnd);
 
   // 2. Batch compute local derived metrics
   const VMAIntervalSet* ivalsetDrvd = groupIdToGroupMetricsMap[groupId];
@@ -878,8 +1020,10 @@ makeSummaryMetrics_Lcl(Prof::CallPath::Profile& profGbl,
 static void
 makeThreadMetrics_Lcl(Prof::CallPath::Profile& profGbl,
 		      const string& profileFile,
-		      const Analysis::Args& args, uint groupId, uint groupMax,
-		      int myRank)
+		      const Analysis::Args& args, 
+		      Prof::Database::traceInfo *traceLcl,
+		      uint threadId, int doPlot,
+		      uint groupId, uint groupMax, int myRank)
 {
   Prof::Metric::Mgr* mMgrGbl = profGbl.metricMgr();
   Prof::CCT::Tree* cctGbl = profGbl.cct();
@@ -894,6 +1038,8 @@ makeThreadMetrics_Lcl(Prof::CallPath::Profile& profGbl,
 
   Prof::CallPath::Profile* prof =
     Analysis::CallPath::read(profileFile, rGroupId, rFlags);
+
+  prof->m_traceInfo = *traceLcl;
 
   // -------------------------------------------------------
   // merge into canonical CCT
@@ -945,8 +1091,15 @@ makeThreadMetrics_Lcl(Prof::CallPath::Profile& profGbl,
     // write local sampled metric values into database
     // -------------------------------------------------------
 
-    string dbFnm = makeDBFileName(args.db_dir, groupId, profileFile);
-    writeMetricsDB(profGbl, mBeg, mEnd, dbFnm);
+    if (Prof::Database::newDBFormat()) {
+      if (doPlot) {
+	Plot::addPlotPoints(profGbl, threadId, mBeg, mEnd);
+      }
+    }
+    else {
+      string dbFnm = makeDBFileName(args.db_dir, groupId, profileFile);
+      writeMetricsDB(profGbl, mBeg, mEnd, dbFnm);
+    }
 
     // -------------------------------------------------------
     // reinitialize metric values for next time
