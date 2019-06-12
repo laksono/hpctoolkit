@@ -204,16 +204,17 @@ makeSummaryDB(Prof::CallPath::Profile & prof, const Analysis::Args & args)
   uint num_cctid = cct_tree->maxDenseId() + 1;
   uint num_metid = prof.metricMgr()->size();
   uint beg_metric, end_metric, last_vis;
+  size_t buf_size = num_cctid * num_metid * 4;
 
   desc = mgr->findFirstVisible();
   beg_metric = (desc) ? desc->id() : 0;
   desc = mgr->findLastVisible();
   last_vis = (desc) ? (desc->id() + 1) : Metric::Mgr::npos;
 
-
   std::cout << "writing summary binary db: "
 	    << "max-cct: " << num_cctid
-	    << ", num-metrics: " << num_metid << ", ...\n";
+	    << ", num-metrics: " << num_metid
+	    << "total buffer (bytes):" << buf_size << ", ...\n";
   std::cout << "first-vis: " << beg_metric
 	    << ", last-vis: " << last_vis << "\n";
 
@@ -236,7 +237,7 @@ makeSummaryDB(Prof::CallPath::Profile & prof, const Analysis::Args & args)
     err(1, "malloc for summary metrics offset table failed");
   }
 
-  metric_table = (struct metric_entry *) malloc(METRIC_BUFFER_SIZE);
+  metric_table = (struct metric_entry *) malloc(buf_size);
   if (metric_table == NULL) {
     err(1, "malloc for summary metrics metric table failed");
   }
@@ -270,13 +271,13 @@ makeSummaryDB(Prof::CallPath::Profile & prof, const Analysis::Args & args)
     if (node != NULL) {
       end_metric = std::min(node->numMetrics(), last_vis);
       for (uint metid = beg_metric; metid < end_metric; metid++) {
-	u32.fval = (float) node->metric(metid);
-	if (u32.fval != 0.0) {
-	  metric_table[next_idx].metid = host_to_be_32(metid);
-	  metric_table[next_idx].metval = host_to_be_32(u32.ival);
-	  next_idx++;
-	  next_off += metric_entry_size;
-	}
+        u32.fval = (float) node->metric(metid);
+        if (u32.fval != 0.0) {
+          metric_table[next_idx].metid = host_to_be_32(metid);
+          metric_table[next_idx].metval = host_to_be_32(u32.ival);
+          next_idx++;
+          next_off += metric_entry_size;
+        }
       }
     }
   }
